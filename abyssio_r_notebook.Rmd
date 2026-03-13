@@ -1,0 +1,267 @@
+---
+title: "Ocean R"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Install system libraries
+
+```{bash}
+sudo apt-get install libnetcdf-dev
+```
+
+# Install required packages
+
+```{r}
+install.packages(c("getPass","ini","aws.s3"))
+```
+
+# Notebook functions, libraries and environmental variables
+
+```{r}
+# %% Libraries
+library(getPass)
+
+# %% Functions
+get_app_config_dir <- function(appname) {
+  app_rel_path <- file.path(".config", appname, paste0(appname, ".conf"))
+  app_system_path <- file.path(path.expand("~"), app_rel_path)
+  return(app_system_path)
+}
+
+# %% Env Var
+appname            <- "oceananalysis"
+server_config_name <- "default"
+```
+
+# Setting Abyssio configuration
+
+```{r}
+# %% Main
+app_system_path <- get_app_config_dir(appname = appname)
+dir.create(dirname(app_system_path), recursive = TRUE, showWarnings = FALSE)
+
+write_file <- FALSE
+
+if (file.exists(app_system_path)) {
+  answer_options <- c("y", "n")
+  repeat {
+    answer <- readline(prompt = paste0(
+      app_system_path,
+      " already exists, do you want to overwrite? [",
+      paste(answer_options, collapse = ", "), "]: "
+    ))
+    if (answer == answer_options[1]) {
+      write_file <- TRUE
+      break
+    } else if (answer == answer_options[2]) {
+      write_file <- FALSE
+      break
+    } else {
+      cat("Answer was not one of the available options, please use either of the answer options:",
+          paste(answer_options, collapse = ", "), "\n")
+    }
+  }
+} else {
+  write_file <- TRUE
+}
+
+if (write_file) {
+  profile    <- "default"
+  access_key <- readline(prompt = "Enter access key: ")
+  secret_key <- getPass("Enter secret key: ")
+
+  config_data <- paste0(
+    "[", profile, "]\n",
+    "access_key = ", access_key, "\n",
+    "secret_key = ", secret_key, "\n",
+    "endpoint = 145.38.204.177:9000\n",
+    "secure = False\n"
+  )
+
+  cat("Writing configuration file to", app_system_path, "\n")
+  writeLines(config_data, con = app_system_path)
+  cat("Done!\n")
+}
+```
+
+# Testing connection
+
+```{r}
+library(aws.s3)
+library(ini)
+
+# %% Main
+app_system_path <- get_app_config_dir(appname = appname)
+config          <- read.ini(app_system_path)
+
+# Set credentials as environment variables (used by aws.s3 internally)
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID"     = trimws(config[[server_config_name]][["access_key"]]),
+  "AWS_SECRET_ACCESS_KEY" = trimws(config[[server_config_name]][["secret_key"]]),
+  "AWS_S3_ENDPOINT" = trimws(config[[server_config_name]][["endpoint"]]))
+options("cloudyr.aws.default_region" = "")
+buckets <- bucketlist(use_https=F)
+cat(buckets$Bucket, sep = "\n")
+```
+
+# Examples using Abyssio
+
+## Setting your connection
+
+```{r}
+# Read configuration
+app_system_path <- get_app_config_dir(appname = appname)
+config          <- read.ini(app_system_path)
+
+# Set credentials as environment variables (used by aws.s3 internally)
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID"     = trimws(config[[server_config_name]][["access_key"]]),
+  "AWS_SECRET_ACCESS_KEY" = trimws(config[[server_config_name]][["secret_key"]]),
+  "AWS_S3_ENDPOINT" = trimws(config[[server_config_name]][["endpoint"]]))
+options("cloudyr.aws.default_region" = "")
+```
+
+## Downloading data
+
+### Downloading a single file
+
+```{r}
+# Downloading a single file
+
+# %% Env var
+# Server location information
+bucket_name <- "input"
+prefix      <- "netcdf"
+file_name   <- "CO2f_fesom_historical_19900101.nc"
+object_name <- paste(prefix, file_name, sep = "/")
+
+# Local location information
+local_download_directory <- "downloads"
+local_download_path      <- file.path(path.expand("~"), local_download_directory)
+local_file_path          <- file.path(local_download_path, file_name)
+
+dir.create(local_download_path, recursive = TRUE, showWarnings = FALSE)
+
+# %% Main
+# Downloading the file
+save_object(
+  object   = object_name,
+  bucket   = bucket_name,
+  file     = local_file_path,
+  use_https = F
+)
+```
+
+### Downloading a full prefix (directory)
+
+```{r}
+# Downloading a full prefix non-recursively
+
+# %% Env var
+# Server location information
+bucket_name <- "input"
+prefix      <- "netcdf/"  # Trailing slash to look into prefix
+
+# Local location information
+local_download_directory <- "downloads"
+local_download_path      <- file.path(path.expand("~"), local_download_directory)
+
+dir.create(local_download_path, recursive = TRUE, showWarnings = FALSE)
+
+# %% Main
+stime <- as.numeric(Sys.time())  # Seconds since Unix epoch
+
+# List objects in prefix (non-recursive)
+objects <- get_bucket(
+  bucket    = bucket_name,
+  prefix    = prefix,
+  delimiter = "/",  # delimiter prevents recursion, equivalent to recursive = False,
+  use_https = F
+)
+
+# Track stats
+nobjs            <- 0
+bytes_downloaded <- 0
+
+# Download the objects
+for (obj in objects) {
+  object_name     <- obj[["Key"]]
+  local_file_path <- file.path(local_download_path, object_name)
+
+  # Ensure subdirectory exists
+  dir.create(dirname(local_file_path), recursive = TRUE, showWarnings = FALSE)
+
+  save_object(
+    object   = object_name,
+    bucket   = bucket_name,
+    file     = local_file_path,
+    use_https = F
+  )
+
+  nobjs            <- nobjs + 1
+  bytes_downloaded <- bytes_downloaded + as.numeric(obj[["Size"]])
+}
+
+# Parse and print stats
+mbytes_downloaded <- bytes_downloaded / (1024^2)
+elapsed           <- as.numeric(Sys.time()) - stime
+mbytes_avg_xfer   <- mbytes_downloaded / elapsed
+
+cat(sprintf(
+  "Downloaded %d files, totalling %.2f MB in %.2fs with an average speed of %.2f MB/s\n",
+  nobjs, mbytes_downloaded, elapsed, mbytes_avg_xfer
+))
+```
+
+## Uploading data
+
+### Uploading a single file
+
+```{r}
+# Upload a single test file
+testfile_path <- file.path(path.expand("~"), "testfile.txt")
+writeLines("Hello World.", testfile_path)  # Uncomment to create the test file
+
+bucket_name <- "personal"
+prefix      <- "analysis/output"
+access_key  <- trimws(config[[server_config_name]][["access_key"]])
+object_name <- paste(access_key, prefix, basename(testfile_path), sep = "/")
+
+put_object(
+  file     = testfile_path,
+  object   = object_name,
+  bucket   = bucket_name,
+  use_https = F
+)
+```
+
+### Uploading a directory
+
+```{r}
+# Create a test directory with files and upload them all
+test_directory <- file.path(path.expand("~"), "test_dir")
+dir.create(test_directory, recursive = TRUE, showWarnings = FALSE)
+
+for (i in 0:9) {
+  writeLines(paste0("This is file ", i),
+             file.path(test_directory, paste0("file_", i, ".txt")))
+}
+
+# Upload the data
+bucket_name <- "personal"
+prefix      <- paste0("analysis/", basename(test_directory))
+access_key  <- trimws(config[[server_config_name]][["access_key"]])
+file_list   <- list.files(test_directory, pattern = "\\.txt$", full.names = TRUE)
+
+for (file_path in file_list) {
+  object_name <- paste(access_key, prefix, basename(file_path), sep = "/")
+  put_object(
+    file     = file_path,
+    object   = object_name,
+    bucket   = bucket_name,
+    use_https = F
+  )
+}
+```
